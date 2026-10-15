@@ -121,14 +121,14 @@ public class MainActivity extends AppCompatActivity {
 
         btnAIEnhance.setOnClickListener(v -> {
             if (!modelLoaded) {
-                Toast.makeText(this, "AI model not available", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "نموذج AI لم يُحمّل", Toast.LENGTH_SHORT).show();
                 return;
             }
             if (lastCapturedFile == null || !lastCapturedFile.exists()) {
-                Toast.makeText(this, "Take a photo first", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "التقط صورة أولاً", Toast.LENGTH_SHORT).show();
                 return;
             }
-            Toast.makeText(this, "Enhancing...", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "جارٍ التحسين بالذكاء الاصطناعي...", Toast.LENGTH_LONG).show();
             enhanceWithAI(lastCapturedFile);
         });
     }
@@ -154,7 +154,7 @@ public class MainActivity extends AppCompatActivity {
             options.setNumThreads(4);
             tflite = new Interpreter(modelBuffer, options);
             modelLoaded = true;
-            Log.i(TAG, "AI model loaded");
+            Log.i(TAG, "AI model loaded: " + declaredLength + " bytes");
         } catch (Throwable e) {
             Log.e(TAG, "AI model not available: " + e.getMessage());
             modelLoaded = false;
@@ -210,33 +210,26 @@ public class MainActivity extends AppCompatActivity {
                 File finalFile = tempFile;
                 try {
                     if (currentZoomLevel > 1.0f) {
-                        finalFile = applyDigitalZoom(tempFile, currentZoomLevel, fileName);
-                        if (finalFile != null) {
-                            lastCapturedFile = finalFile;
-                        } else {
-                            finalFile = tempFile;
+                        File zoomed = applyDigitalZoom(tempFile, currentZoomLevel, fileName);
+                        if (zoomed != null) {
+                            finalFile = zoomed;
+                            lastCapturedFile = zoomed;
                         }
                     }
 
-                    Uri galleryUri = saveToPublicGallery(
-                            finalFile != null ? finalFile : tempFile, fileName);
-
-                    final File displayFile = finalFile != null ? finalFile : tempFile;
+                    Uri galleryUri = saveToPublicGallery(finalFile, fileName);
+                    final File displayFile = finalFile;
 
                     runOnUiThread(() -> {
-                        try {
-                            Bitmap bitmap = BitmapFactory.decodeFile(displayFile.getAbsolutePath());
-                            if (bitmap != null) {
-                                ivResult.setImageBitmap(bitmap);
-                                ivResult.setVisibility(View.VISIBLE);
-                            }
-                            if (galleryUri != null) {
-                                Toast.makeText(MainActivity.this,
-                                        "Saved at " + (int) currentZoomLevel + "x",
-                                        Toast.LENGTH_LONG).show();
-                            }
-                        } catch (Throwable t) {
-                            Log.e(TAG, "Display failed", t);
+                        Bitmap bitmap = BitmapFactory.decodeFile(displayFile.getAbsolutePath());
+                        if (bitmap != null) {
+                            ivResult.setImageBitmap(bitmap);
+                            ivResult.setVisibility(View.VISIBLE);
+                        }
+                        if (galleryUri != null) {
+                            Toast.makeText(MainActivity.this,
+                                    "تم الحفظ في Pictures/ProCamera100x",
+                                    Toast.LENGTH_LONG).show();
                         }
                     });
                 } catch (Throwable t) {
@@ -320,31 +313,36 @@ public class MainActivity extends AppCompatActivity {
                     return;
                 }
 
-                int inputSize = 50;
-                int outputSize = 200;
-                int tilesX = Math.max(1, source.getWidth() / inputSize);
-                int tilesY = Math.max(1, source.getHeight() / inputSize);
+                int[] shape = tflite.getInputTensor(0).shape();
+                int inH = shape[1];
+                int inW = shape[2];
+
+                int tilesX = Math.max(1, source.getWidth() / inW);
+                int tilesY = Math.max(1, source.getHeight() / inH);
+                int scale = 4;
+                int outW = inW * scale;
+                int outH = inH * scale;
 
                 Bitmap result = Bitmap.createBitmap(
-                        tilesX * outputSize, tilesY * outputSize, Bitmap.Config.ARGB_8888);
+                        tilesX * outW, tilesY * outH, Bitmap.Config.ARGB_8888);
 
                 for (int ty = 0; ty < tilesY; ty++) {
                     for (int tx = 0; tx < tilesX; tx++) {
-                        int x = tx * inputSize;
-                        int y = ty * inputSize;
-                        int w = Math.min(inputSize, source.getWidth() - x);
-                        int h = Math.min(inputSize, source.getHeight() - y);
+                        int x = tx * inW;
+                        int y = ty * inH;
+                        int w = Math.min(inW, source.getWidth() - x);
+                        int h = Math.min(inH, source.getHeight() - y);
                         if (w <= 0 || h <= 0) continue;
 
                         Bitmap tile = Bitmap.createBitmap(source, x, y, w, h);
-                        Bitmap inputTile = Bitmap.createScaledBitmap(tile, inputSize, inputSize, true);
+                        Bitmap inputTile = Bitmap.createScaledBitmap(tile, inW, inH, true);
 
                         ByteBuffer inputBuffer = ByteBuffer.allocateDirect(
-                                4 * inputSize * inputSize * 3);
+                                4 * inW * inH * 3);
                         inputBuffer.order(ByteOrder.nativeOrder());
 
-                        int[] pixels = new int[inputSize * inputSize];
-                        inputTile.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize);
+                        int[] pixels = new int[inW * inH];
+                        inputTile.getPixels(pixels, 0, inW, 0, 0, inW, inH);
 
                         for (int px : pixels) {
                             float r = ((px >> 16) & 0xFF) / 255.0f;
@@ -357,14 +355,14 @@ public class MainActivity extends AppCompatActivity {
                         inputBuffer.rewind();
 
                         ByteBuffer outputBuffer = ByteBuffer.allocateDirect(
-                                4 * outputSize * outputSize * 3);
+                                4 * outW * outH * 3);
                         outputBuffer.order(ByteOrder.nativeOrder());
 
                         tflite.run(inputBuffer, outputBuffer);
 
                         outputBuffer.rewind();
-                        int[] outPixels = new int[outputSize * outputSize];
-                        for (int i = 0; i < outputSize * outputSize; i++) {
+                        int[] outPixels = new int[outW * outH];
+                        for (int i = 0; i < outW * outH; i++) {
                             float r = outputBuffer.getFloat();
                             float g = outputBuffer.getFloat();
                             float b = outputBuffer.getFloat();
@@ -374,14 +372,13 @@ public class MainActivity extends AppCompatActivity {
                             outPixels[i] = 0xFF000000 | (ri << 16) | (gi << 8) | bi;
                         }
 
-                        Bitmap outputTile = Bitmap.createBitmap(
-                                outputSize, outputSize, Bitmap.Config.ARGB_8888);
-                        outputTile.setPixels(outPixels, 0, outputSize, 0, 0, outputSize, outputSize);
+                        Bitmap outputTile = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888);
+                        outputTile.setPixels(outPixels, 0, outW, 0, 0, outW, outH);
 
-                        int destX = tx * outputSize;
-                        int destY = ty * outputSize;
-                        for (int py = 0; py < outputSize; py++) {
-                            for (int px = 0; px < outputSize; px++) {
+                        int destX = tx * outW;
+                        int destY = ty * outH;
+                        for (int py = 0; py < outH; py++) {
+                            for (int px = 0; px < outW; px++) {
                                 if (destX + px < result.getWidth() && destY + py < result.getHeight()) {
                                     result.setPixel(destX + px, destY + py, outputTile.getPixel(px, py));
                                 }
@@ -404,19 +401,15 @@ public class MainActivity extends AppCompatActivity {
 
                 Bitmap finalResult = result;
                 runOnUiThread(() -> {
-                    try {
-                        ivResult.setImageBitmap(finalResult);
-                        ivResult.setVisibility(View.VISIBLE);
-                        Toast.makeText(this, "Enhanced successfully", Toast.LENGTH_LONG).show();
-                    } catch (Throwable t) {
-                        Log.e(TAG, "Display enhance failed", t);
-                    }
+                    ivResult.setImageBitmap(finalResult);
+                    ivResult.setVisibility(View.VISIBLE);
+                    Toast.makeText(this, "تم تحسين الصورة بالذكاء الاصطناعي", Toast.LENGTH_LONG).show();
                 });
 
             } catch (Throwable e) {
                 Log.e(TAG, "Enhance failed", e);
-                runOnUiThread(() -> Toast.makeText(this, "Enhance failed: " + e.getMessage(),
-                        Toast.LENGTH_LONG).show());
+                runOnUiThread(() -> Toast.makeText(this,
+                        "فشل التحسين: " + e.getMessage(), Toast.LENGTH_LONG).show());
             } finally {
                 if (source != null) source.recycle();
             }
@@ -425,7 +418,7 @@ public class MainActivity extends AppCompatActivity {
 
     private Uri saveToPublicGallery(File sourceFile, String fileName) {
         java.io.OutputStream outputStream = null;
-        java.io.FileInputStream inputStream = null;
+        FileInputStream inputStream = null;
         try {
             ContentValues values = new ContentValues();
             values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
@@ -451,7 +444,7 @@ public class MainActivity extends AppCompatActivity {
             if (uri == null) return null;
 
             outputStream = getContentResolver().openOutputStream(uri);
-            inputStream = new java.io.FileInputStream(sourceFile);
+            inputStream = new FileInputStream(sourceFile);
 
             if (outputStream == null) return null;
 
@@ -495,7 +488,7 @@ public class MainActivity extends AppCompatActivity {
             if (allPermissionsGranted()) {
                 startCamera();
             } else {
-                Toast.makeText(this, "Permissions required", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "الصلاحيات مطلوبة", Toast.LENGTH_SHORT).show();
                 finish();
             }
         }
