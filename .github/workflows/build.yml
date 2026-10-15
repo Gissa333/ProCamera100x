@@ -35,15 +35,12 @@ jobs:
           yes | sdkmanager --licenses || true
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Download AI Model (ESRGAN TFLite)
+      - name: Download AI Model
         run: |
           mkdir -p app/src/main/assets
           cd app/src/main/assets
-          # تحميل نموذج ESRGAN من TensorFlow Hub (رابط مباشر لنسخة TFLite)
-          wget -q -O esrgan.tflite "https://storage.googleapis.com/tfhub-lite-models/captain-pool/lite-model/esrgan-tf2/lite/1/default/1.tflite" || \
-          wget -q -O esrgan.tflite "https://github.com/tensorflow/examples/raw/master/lite/examples/super_resolution/android/app/src/main/assets/sr.tflite" || \
-          echo "فشل تحميل النموذج - سنستخدم نموذجاً مدمجاً"
-          ls -la
+          wget -q -O esrgan.tflite "https://github.com/Gissa333/ProCamera100x/releases/download/model-v1/realesr_general_x4v3.tflite"
+          ls -la esrgan.tflite
 
       - name: Generate Gradle Wrapper
         run: gradle wrapper --gradle-version 8.2
