@@ -1,10 +1,15 @@
 package com.procamera.x100;
 
 import android.Manifest;
+import android.content.ContentValues;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Environment;
+import android.provider.MediaStore;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
@@ -28,6 +33,12 @@ import androidx.core.content.ContextCompat;
 import com.google.common.util.concurrent.ListenableFuture;
 
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -63,18 +74,18 @@ public class MainActivity extends AppCompatActivity {
 
         cameraExecutor = Executors.newSingleThreadExecutor();
 
-        // طلب الصلاحيات
         if (allPermissionsGranted()) {
             startCamera();
         } else {
             ActivityCompat.requestPermissions(this,
-                    new String[]{Manifest.permission.CAMERA,
+                    new String[]{
+                            Manifest.permission.CAMERA,
                             Manifest.permission.WRITE_EXTERNAL_STORAGE,
-                            Manifest.permission.READ_EXTERNAL_STORAGE},
+                            Manifest.permission.READ_EXTERNAL_STORAGE
+                    },
                     REQUEST_CODE_PERMISSIONS);
         }
 
-        // شريط التقريب يتحكم في تقريب الكاميرا الأصلي
         zoomSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
@@ -94,10 +105,8 @@ public class MainActivity extends AppCompatActivity {
 
         btnCapture.setOnClickListener(v -> takePhoto());
 
-        btnAIEnhance.setOnClickListener(v -> {
-            Toast.makeText(this, "تحسين AI قيد التطوير", Toast.LENGTH_SHORT).show();
-            // TODO: دمج نموذج ESRGAN TFLite هنا
-        });
+        btnAIEnhance.setOnClickListener(v ->
+                Toast.makeText(this, "تحسين AI قيد التطوير", Toast.LENGTH_SHORT).show());
     }
 
     private void startCamera() {
@@ -132,23 +141,38 @@ public class MainActivity extends AppCompatActivity {
     private void takePhoto() {
         if (imageCapture == null) return;
 
-        File photoFile = new File(getExternalFilesDir(null),
-                "capture_" + System.currentTimeMillis() + ".jpg");
+        // اسم ملف فريد
+        String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
+        String fileName = "ProCam_" + timeStamp + ".jpg";
+
+        // مجلد مؤقت داخل التطبيق أولاً
+        File tempFile = new File(getExternalFilesDir(null), fileName);
 
         ImageCapture.OutputFileOptions outputOptions =
-                new ImageCapture.OutputFileOptions.Builder(photoFile).build();
+                new ImageCapture.OutputFileOptions.Builder(tempFile).build();
 
         imageCapture.takePicture(outputOptions, cameraExecutor,
                 new ImageCapture.OnImageSavedCallback() {
             @Override
             public void onImageSaved(@NonNull ImageCapture.OutputFileResults outputFileResults) {
+                // حفظ في المعرض العام
+                Uri galleryUri = saveToPublicGallery(tempFile, fileName);
+
                 runOnUiThread(() -> {
-                    Bitmap bitmap = BitmapFactory.decodeFile(photoFile.getAbsolutePath());
-                    ivResult.setImageBitmap(bitmap);
-                    ivResult.setVisibility(View.VISIBLE);
-                    Toast.makeText(MainActivity.this,
-                            "تم الالتقاط: " + photoFile.getAbsolutePath(),
-                            Toast.LENGTH_LONG).show();
+                    Bitmap bitmap = BitmapFactory.decodeFile(tempFile.getAbsolutePath());
+                    if (bitmap != null) {
+                        ivResult.setImageBitmap(bitmap);
+                        ivResult.setVisibility(View.VISIBLE);
+                    }
+                    if (galleryUri != null) {
+                        Toast.makeText(MainActivity.this,
+                                "تم الحفظ في Pictures/ProCamera100x",
+                                Toast.LENGTH_LONG).show();
+                    } else {
+                        Toast.makeText(MainActivity.this,
+                                "فشل الحفظ في المعرض",
+                                Toast.LENGTH_LONG).show();
+                    }
                 });
             }
 
@@ -157,6 +181,75 @@ public class MainActivity extends AppCompatActivity {
                 Log.e(TAG, "فشل الالتقاط", exception);
             }
         });
+    }
+
+    /**
+     * حفظ الصورة في مجلد Pictures/ProCamera100x العام
+     */
+    private Uri saveToPublicGallery(File sourceFile, String fileName) {
+        OutputStream outputStream = null;
+        FileInputStream inputStream = null;
+        try {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
+            values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // أندرويد 10 وما فوق - استخدام RELATIVE_PATH
+                values.put(MediaStore.Images.Media.RELATIVE_PATH,
+                        Environment.DIRECTORY_PICTURES + "/ProCamera100x");
+                values.put(MediaStore.Images.Media.IS_PENDING, 1);
+            } else {
+                // أندرويد 9 وما دون - استخدام DATA (المسار المباشر)
+                File picturesDir = new File(
+                        Environment.getExternalStoragePublicDirectory(
+                                Environment.DIRECTORY_PICTURES),
+                        "ProCamera100x");
+                if (!picturesDir.exists()) {
+                    picturesDir.mkdirs();
+                }
+                File destFile = new File(picturesDir, fileName);
+                values.put(MediaStore.Images.Media.DATA, destFile.getAbsolutePath());
+            }
+
+            Uri uri = getContentResolver().insert(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+
+            if (uri == null) {
+                Log.e(TAG, "insert returned null URI");
+                return null;
+            }
+
+            outputStream = getContentResolver().openOutputStream(uri);
+            inputStream = new FileInputStream(sourceFile);
+
+            if (outputStream == null) return null;
+
+            byte[] buffer = new byte[8192];
+            int bytesRead;
+            while ((bytesRead = inputStream.read(buffer)) != -1) {
+                outputStream.write(buffer, 0, bytesRead);
+            }
+            outputStream.flush();
+
+            // إزالة IS_PENDING ليصبح الملف مرئياً
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.clear();
+                values.put(MediaStore.Images.Media.IS_PENDING, 0);
+                getContentResolver().update(uri, values, null, null);
+            }
+
+            return uri;
+
+        } catch (IOException e) {
+            Log.e(TAG, "فشل حفظ الصورة", e);
+            return null;
+        } finally {
+            try {
+                if (outputStream != null) outputStream.close();
+                if (inputStream != null) inputStream.close();
+            } catch (IOException ignored) {}
+        }
     }
 
     private boolean allPermissionsGranted() {
@@ -173,7 +266,7 @@ public class MainActivity extends AppCompatActivity {
             if (allPermissionsGranted()) {
                 startCamera();
             } else {
-                Toast.makeText(this, "الصلاحيات مطلوبة لتشغيل الكاميرا",
+                Toast.makeText(this, "الصلاحيات مطلوبة",
                         Toast.LENGTH_SHORT).show();
                 finish();
             }
