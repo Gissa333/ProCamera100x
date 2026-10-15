@@ -121,7 +121,7 @@ public class MainActivity extends AppCompatActivity {
 
         btnAIEnhance.setOnClickListener(v -> {
             if (!modelLoaded) {
-                Toast.makeText(this, "AI model not loaded", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "AI model not available", Toast.LENGTH_SHORT).show();
                 return;
             }
             if (lastCapturedFile == null || !lastCapturedFile.exists()) {
@@ -140,6 +140,13 @@ public class MainActivity extends AppCompatActivity {
             FileChannel fileChannel = inputStream.getChannel();
             long startOffset = fileDescriptor.getStartOffset();
             long declaredLength = fileDescriptor.getDeclaredLength();
+
+            if (declaredLength <= 0) {
+                modelLoaded = false;
+                tflite = null;
+                return;
+            }
+
             MappedByteBuffer modelBuffer = fileChannel.map(
                     FileChannel.MapMode.READ_ONLY, startOffset, declaredLength);
 
@@ -147,10 +154,11 @@ public class MainActivity extends AppCompatActivity {
             options.setNumThreads(4);
             tflite = new Interpreter(modelBuffer, options);
             modelLoaded = true;
-            Log.i(TAG, "AI model loaded successfully");
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to load AI model", e);
+            Log.i(TAG, "AI model loaded");
+        } catch (Throwable e) {
+            Log.e(TAG, "AI model not available: " + e.getMessage());
             modelLoaded = false;
+            tflite = null;
         }
     }
 
@@ -200,28 +208,40 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onImageSaved(@NonNull ImageCapture.OutputFileResults outputFileResults) {
                 File finalFile = tempFile;
-                if (currentZoomLevel > 1.0f) {
-                    finalFile = applyDigitalZoom(tempFile, currentZoomLevel, fileName);
-                    lastCapturedFile = finalFile;
+                try {
+                    if (currentZoomLevel > 1.0f) {
+                        finalFile = applyDigitalZoom(tempFile, currentZoomLevel, fileName);
+                        if (finalFile != null) {
+                            lastCapturedFile = finalFile;
+                        } else {
+                            finalFile = tempFile;
+                        }
+                    }
+
+                    Uri galleryUri = saveToPublicGallery(
+                            finalFile != null ? finalFile : tempFile, fileName);
+
+                    final File displayFile = finalFile != null ? finalFile : tempFile;
+
+                    runOnUiThread(() -> {
+                        try {
+                            Bitmap bitmap = BitmapFactory.decodeFile(displayFile.getAbsolutePath());
+                            if (bitmap != null) {
+                                ivResult.setImageBitmap(bitmap);
+                                ivResult.setVisibility(View.VISIBLE);
+                            }
+                            if (galleryUri != null) {
+                                Toast.makeText(MainActivity.this,
+                                        "Saved at " + (int) currentZoomLevel + "x",
+                                        Toast.LENGTH_LONG).show();
+                            }
+                        } catch (Throwable t) {
+                            Log.e(TAG, "Display failed", t);
+                        }
+                    });
+                } catch (Throwable t) {
+                    Log.e(TAG, "Save failed", t);
                 }
-
-                Uri galleryUri = saveToPublicGallery(
-                        finalFile != null ? finalFile : tempFile, fileName);
-
-                final File displayFile = finalFile != null ? finalFile : tempFile;
-
-                runOnUiThread(() -> {
-                    Bitmap bitmap = BitmapFactory.decodeFile(displayFile.getAbsolutePath());
-                    if (bitmap != null) {
-                        ivResult.setImageBitmap(bitmap);
-                        ivResult.setVisibility(View.VISIBLE);
-                    }
-                    if (galleryUri != null) {
-                        Toast.makeText(MainActivity.this,
-                                "Saved at " + (int) currentZoomLevel + "x",
-                                Toast.LENGTH_LONG).show();
-                    }
-                });
             }
 
             @Override
@@ -232,8 +252,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private File applyDigitalZoom(File sourceFile, float zoomLevel, String fileName) {
+        Bitmap source = null;
+        Bitmap cropped = null;
+        Bitmap scaled = null;
         try {
-            Bitmap source = BitmapFactory.decodeFile(sourceFile.getAbsolutePath());
+            BitmapFactory.Options opts = new BitmapFactory.Options();
+            opts.inSampleSize = 2;
+            source = BitmapFactory.decodeFile(sourceFile.getAbsolutePath(), opts);
             if (source == null) return sourceFile;
 
             int srcW = source.getWidth();
@@ -250,29 +275,45 @@ public class MainActivity extends AppCompatActivity {
             int newH = (int) (srcH * cropFactor);
             if (newW < 100) newW = 100;
             if (newH < 100) newH = 100;
+            if (newW > srcW) newW = srcW;
+            if (newH > srcH) newH = srcH;
 
-            int startX = (srcW - newW) / 2;
-            int startY = (srcH - newH) / 2;
+            int startX = Math.max(0, (srcW - newW) / 2);
+            int startY = Math.max(0, (srcH - newH) / 2);
 
-            Bitmap cropped = Bitmap.createBitmap(source, startX, startY, newW, newH);
-            Bitmap scaled = Bitmap.createScaledBitmap(cropped, newW * 2, newH * 2, true);
+            cropped = Bitmap.createBitmap(source, startX, startY, newW, newH);
+            scaled = Bitmap.createScaledBitmap(cropped, newW * 2, newH * 2, true);
 
             File zoomedFile = new File(getExternalFilesDir(null), "zoomed_" + fileName);
             try (FileOutputStream fos = new FileOutputStream(zoomedFile)) {
                 scaled.compress(Bitmap.CompressFormat.JPEG, 95, fos);
             }
-            if (cropped != source) cropped.recycle();
             return zoomedFile;
-        } catch (Exception e) {
+        } catch (Throwable e) {
             Log.e(TAG, "Digital zoom failed", e);
             return sourceFile;
+        } finally {
+            try {
+                if (cropped != null && cropped != source) cropped.recycle();
+                if (scaled != null) scaled.recycle();
+                if (source != null) source.recycle();
+            } catch (Throwable ignored) {}
         }
     }
 
     private void enhanceWithAI(File sourceFile) {
         new Thread(() -> {
+            Bitmap source = null;
             try {
-                Bitmap source = BitmapFactory.decodeFile(sourceFile.getAbsolutePath());
+                if (tflite == null) {
+                    runOnUiThread(() -> Toast.makeText(this, "AI model not loaded",
+                            Toast.LENGTH_SHORT).show());
+                    return;
+                }
+
+                BitmapFactory.Options opts = new BitmapFactory.Options();
+                opts.inSampleSize = 4;
+                source = BitmapFactory.decodeFile(sourceFile.getAbsolutePath(), opts);
                 if (source == null) {
                     runOnUiThread(() -> Toast.makeText(this, "Cannot read image",
                             Toast.LENGTH_SHORT).show());
@@ -281,19 +322,18 @@ public class MainActivity extends AppCompatActivity {
 
                 int inputSize = 50;
                 int outputSize = 200;
-                int tileSize = inputSize;
-                int tilesX = Math.max(1, source.getWidth() / tileSize);
-                int tilesY = Math.max(1, source.getHeight() / tileSize);
+                int tilesX = Math.max(1, source.getWidth() / inputSize);
+                int tilesY = Math.max(1, source.getHeight() / inputSize);
 
                 Bitmap result = Bitmap.createBitmap(
                         tilesX * outputSize, tilesY * outputSize, Bitmap.Config.ARGB_8888);
 
                 for (int ty = 0; ty < tilesY; ty++) {
                     for (int tx = 0; tx < tilesX; tx++) {
-                        int x = tx * tileSize;
-                        int y = ty * tileSize;
-                        int w = Math.min(tileSize, source.getWidth() - x);
-                        int h = Math.min(tileSize, source.getHeight() - y);
+                        int x = tx * inputSize;
+                        int y = ty * inputSize;
+                        int w = Math.min(inputSize, source.getWidth() - x);
+                        int h = Math.min(inputSize, source.getHeight() - y);
                         if (w <= 0 || h <= 0) continue;
 
                         Bitmap tile = Bitmap.createBitmap(source, x, y, w, h);
@@ -364,17 +404,21 @@ public class MainActivity extends AppCompatActivity {
 
                 Bitmap finalResult = result;
                 runOnUiThread(() -> {
-                    ivResult.setImageBitmap(finalResult);
-                    ivResult.setVisibility(View.VISIBLE);
-                    Toast.makeText(this, "Enhanced successfully", Toast.LENGTH_LONG).show();
+                    try {
+                        ivResult.setImageBitmap(finalResult);
+                        ivResult.setVisibility(View.VISIBLE);
+                        Toast.makeText(this, "Enhanced successfully", Toast.LENGTH_LONG).show();
+                    } catch (Throwable t) {
+                        Log.e(TAG, "Display enhance failed", t);
+                    }
                 });
 
-                source.recycle();
-
-            } catch (Exception e) {
+            } catch (Throwable e) {
                 Log.e(TAG, "Enhance failed", e);
                 runOnUiThread(() -> Toast.makeText(this, "Enhance failed: " + e.getMessage(),
                         Toast.LENGTH_LONG).show());
+            } finally {
+                if (source != null) source.recycle();
             }
         }).start();
     }
@@ -426,7 +470,7 @@ public class MainActivity extends AppCompatActivity {
 
             return uri;
 
-        } catch (IOException e) {
+        } catch (Throwable e) {
             Log.e(TAG, "Gallery save failed", e);
             return null;
         } finally {
@@ -460,7 +504,9 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        cameraExecutor.shutdown();
-        if (tflite != null) tflite.close();
+        try {
+            cameraExecutor.shutdown();
+            if (tflite != null) tflite.close();
+        } catch (Throwable ignored) {}
     }
 }
