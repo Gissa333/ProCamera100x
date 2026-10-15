@@ -9,7 +9,7 @@ import android.widget.LinearLayout;
 public class ZoomLinearLayout extends LinearLayout implements ScaleGestureDetector.OnScaleGestureListener {
 
     private static final float MIN_ZOOM = 1.0f;
-    private static final float MAX_ZOOM = 100.0f; // التقريب حتى 100x
+    private static final float MAX_ZOOM = 100.0f;
 
     private ScaleGestureDetector scaleDetector;
     private float scale = 1.0f;
@@ -60,7 +60,6 @@ public class ZoomLinearLayout extends LinearLayout implements ScaleGestureDetect
 
     @Override
     public void onScaleEnd(ScaleGestureDetector detector) {
-        // يمكن إضافة منطق إضافي هنا عند الحاجة
     }
 
     public float getScale() {
