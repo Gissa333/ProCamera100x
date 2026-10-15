@@ -3,6 +3,7 @@ package com.procamera.x100;
 import android.Manifest;
 import android.content.ContentValues;
 import android.content.pm.PackageManager;
+import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.net.Uri;
@@ -32,10 +33,16 @@ import androidx.core.content.ContextCompat;
 
 import com.google.common.util.concurrent.ListenableFuture;
 
+import org.tensorflow.lite.Interpreter;
+
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
@@ -58,6 +65,11 @@ public class MainActivity extends AppCompatActivity {
     private ImageCapture imageCapture;
     private Camera camera;
     private ExecutorService cameraExecutor;
+    private Interpreter tflite;
+    private boolean modelLoaded = false;
+
+    private float currentZoomLevel = 1.0f;
+    private File lastCapturedFile = null;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -74,6 +86,8 @@ public class MainActivity extends AppCompatActivity {
 
         cameraExecutor = Executors.newSingleThreadExecutor();
 
+        loadModel();
+
         if (allPermissionsGranted()) {
             startCamera();
         } else {
@@ -89,12 +103,12 @@ public class MainActivity extends AppCompatActivity {
         zoomSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                currentZoomLevel = Math.max(1f, progress);
                 if (camera != null) {
-                    float zoomRatio = Math.max(1f, progress);
                     try {
-                        camera.getCameraControl().setZoomRatio(zoomRatio);
+                        camera.getCameraControl().setZoomRatio(currentZoomLevel);
                     } catch (Exception e) {
-                        Log.e(TAG, "لا يمكن ضبط التقريب إلى " + zoomRatio, e);
+                        Log.e(TAG, "Cannot set zoom", e);
                     }
                     tvZoomLevel.setText(progress + "x");
                 }
@@ -105,8 +119,39 @@ public class MainActivity extends AppCompatActivity {
 
         btnCapture.setOnClickListener(v -> takePhoto());
 
-        btnAIEnhance.setOnClickListener(v ->
-                Toast.makeText(this, "تحسين AI قيد التطوير", Toast.LENGTH_SHORT).show());
+        btnAIEnhance.setOnClickListener(v -> {
+            if (!modelLoaded) {
+                Toast.makeText(this, "AI model not loaded", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            if (lastCapturedFile == null || !lastCapturedFile.exists()) {
+                Toast.makeText(this, "Take a photo first", Toast.LENGTH_SHORT).show();
+                return;
+            }
+            Toast.makeText(this, "Enhancing...", Toast.LENGTH_SHORT).show();
+            enhanceWithAI(lastCapturedFile);
+        });
+    }
+
+    private void loadModel() {
+        try {
+            AssetFileDescriptor fileDescriptor = getAssets().openFd("esrgan.tflite");
+            FileInputStream inputStream = new FileInputStream(fileDescriptor.getFileDescriptor());
+            FileChannel fileChannel = inputStream.getChannel();
+            long startOffset = fileDescriptor.getStartOffset();
+            long declaredLength = fileDescriptor.getDeclaredLength();
+            MappedByteBuffer modelBuffer = fileChannel.map(
+                    FileChannel.MapMode.READ_ONLY, startOffset, declaredLength);
+
+            Interpreter.Options options = new Interpreter.Options();
+            options.setNumThreads(4);
+            tflite = new Interpreter(modelBuffer, options);
+            modelLoaded = true;
+            Log.i(TAG, "AI model loaded successfully");
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to load AI model", e);
+            modelLoaded = false;
+        }
     }
 
     private void startCamera() {
@@ -133,7 +178,7 @@ public class MainActivity extends AppCompatActivity {
                         this, cameraSelector, preview, imageCapture);
 
             } catch (ExecutionException | InterruptedException e) {
-                Log.e(TAG, "فشل تشغيل الكاميرا", e);
+                Log.e(TAG, "Camera start failed", e);
             }
         }, ContextCompat.getMainExecutor(this));
     }
@@ -141,12 +186,11 @@ public class MainActivity extends AppCompatActivity {
     private void takePhoto() {
         if (imageCapture == null) return;
 
-        // اسم ملف فريد
         String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
         String fileName = "ProCam_" + timeStamp + ".jpg";
 
-        // مجلد مؤقت داخل التطبيق أولاً
         File tempFile = new File(getExternalFilesDir(null), fileName);
+        lastCapturedFile = tempFile;
 
         ImageCapture.OutputFileOptions outputOptions =
                 new ImageCapture.OutputFileOptions.Builder(tempFile).build();
@@ -155,22 +199,26 @@ public class MainActivity extends AppCompatActivity {
                 new ImageCapture.OnImageSavedCallback() {
             @Override
             public void onImageSaved(@NonNull ImageCapture.OutputFileResults outputFileResults) {
-                // حفظ في المعرض العام
-                Uri galleryUri = saveToPublicGallery(tempFile, fileName);
+                File finalFile = tempFile;
+                if (currentZoomLevel > 1.0f) {
+                    finalFile = applyDigitalZoom(tempFile, currentZoomLevel, fileName);
+                    lastCapturedFile = finalFile;
+                }
+
+                Uri galleryUri = saveToPublicGallery(
+                        finalFile != null ? finalFile : tempFile, fileName);
+
+                final File displayFile = finalFile != null ? finalFile : tempFile;
 
                 runOnUiThread(() -> {
-                    Bitmap bitmap = BitmapFactory.decodeFile(tempFile.getAbsolutePath());
+                    Bitmap bitmap = BitmapFactory.decodeFile(displayFile.getAbsolutePath());
                     if (bitmap != null) {
                         ivResult.setImageBitmap(bitmap);
                         ivResult.setVisibility(View.VISIBLE);
                     }
                     if (galleryUri != null) {
                         Toast.makeText(MainActivity.this,
-                                "تم الحفظ في Pictures/ProCamera100x",
-                                Toast.LENGTH_LONG).show();
-                    } else {
-                        Toast.makeText(MainActivity.this,
-                                "فشل الحفظ في المعرض",
+                                "Saved at " + (int) currentZoomLevel + "x",
                                 Toast.LENGTH_LONG).show();
                     }
                 });
@@ -178,36 +226,177 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onError(@NonNull ImageCaptureException exception) {
-                Log.e(TAG, "فشل الالتقاط", exception);
+                Log.e(TAG, "Capture failed", exception);
             }
         });
     }
 
-    /**
-     * حفظ الصورة في مجلد Pictures/ProCamera100x العام
-     */
+    private File applyDigitalZoom(File sourceFile, float zoomLevel, String fileName) {
+        try {
+            Bitmap source = BitmapFactory.decodeFile(sourceFile.getAbsolutePath());
+            if (source == null) return sourceFile;
+
+            int srcW = source.getWidth();
+            int srcH = source.getHeight();
+
+            float cropFactor;
+            if (zoomLevel <= 10f) {
+                cropFactor = 1.0f / (1.0f + (zoomLevel - 1.0f) * 0.1f);
+            } else {
+                cropFactor = 10f / zoomLevel;
+            }
+
+            int newW = (int) (srcW * cropFactor);
+            int newH = (int) (srcH * cropFactor);
+            if (newW < 100) newW = 100;
+            if (newH < 100) newH = 100;
+
+            int startX = (srcW - newW) / 2;
+            int startY = (srcH - newH) / 2;
+
+            Bitmap cropped = Bitmap.createBitmap(source, startX, startY, newW, newH);
+            Bitmap scaled = Bitmap.createScaledBitmap(cropped, newW * 2, newH * 2, true);
+
+            File zoomedFile = new File(getExternalFilesDir(null), "zoomed_" + fileName);
+            try (FileOutputStream fos = new FileOutputStream(zoomedFile)) {
+                scaled.compress(Bitmap.CompressFormat.JPEG, 95, fos);
+            }
+            if (cropped != source) cropped.recycle();
+            return zoomedFile;
+        } catch (Exception e) {
+            Log.e(TAG, "Digital zoom failed", e);
+            return sourceFile;
+        }
+    }
+
+    private void enhanceWithAI(File sourceFile) {
+        new Thread(() -> {
+            try {
+                Bitmap source = BitmapFactory.decodeFile(sourceFile.getAbsolutePath());
+                if (source == null) {
+                    runOnUiThread(() -> Toast.makeText(this, "Cannot read image",
+                            Toast.LENGTH_SHORT).show());
+                    return;
+                }
+
+                int inputSize = 50;
+                int outputSize = 200;
+                int tileSize = inputSize;
+                int tilesX = Math.max(1, source.getWidth() / tileSize);
+                int tilesY = Math.max(1, source.getHeight() / tileSize);
+
+                Bitmap result = Bitmap.createBitmap(
+                        tilesX * outputSize, tilesY * outputSize, Bitmap.Config.ARGB_8888);
+
+                for (int ty = 0; ty < tilesY; ty++) {
+                    for (int tx = 0; tx < tilesX; tx++) {
+                        int x = tx * tileSize;
+                        int y = ty * tileSize;
+                        int w = Math.min(tileSize, source.getWidth() - x);
+                        int h = Math.min(tileSize, source.getHeight() - y);
+                        if (w <= 0 || h <= 0) continue;
+
+                        Bitmap tile = Bitmap.createBitmap(source, x, y, w, h);
+                        Bitmap inputTile = Bitmap.createScaledBitmap(tile, inputSize, inputSize, true);
+
+                        ByteBuffer inputBuffer = ByteBuffer.allocateDirect(
+                                4 * inputSize * inputSize * 3);
+                        inputBuffer.order(ByteOrder.nativeOrder());
+
+                        int[] pixels = new int[inputSize * inputSize];
+                        inputTile.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize);
+
+                        for (int px : pixels) {
+                            float r = ((px >> 16) & 0xFF) / 255.0f;
+                            float g = ((px >> 8) & 0xFF) / 255.0f;
+                            float b = (px & 0xFF) / 255.0f;
+                            inputBuffer.putFloat(r);
+                            inputBuffer.putFloat(g);
+                            inputBuffer.putFloat(b);
+                        }
+                        inputBuffer.rewind();
+
+                        ByteBuffer outputBuffer = ByteBuffer.allocateDirect(
+                                4 * outputSize * outputSize * 3);
+                        outputBuffer.order(ByteOrder.nativeOrder());
+
+                        tflite.run(inputBuffer, outputBuffer);
+
+                        outputBuffer.rewind();
+                        int[] outPixels = new int[outputSize * outputSize];
+                        for (int i = 0; i < outputSize * outputSize; i++) {
+                            float r = outputBuffer.getFloat();
+                            float g = outputBuffer.getFloat();
+                            float b = outputBuffer.getFloat();
+                            int ri = Math.min(255, Math.max(0, (int) (r * 255)));
+                            int gi = Math.min(255, Math.max(0, (int) (g * 255)));
+                            int bi = Math.min(255, Math.max(0, (int) (b * 255)));
+                            outPixels[i] = 0xFF000000 | (ri << 16) | (gi << 8) | bi;
+                        }
+
+                        Bitmap outputTile = Bitmap.createBitmap(
+                                outputSize, outputSize, Bitmap.Config.ARGB_8888);
+                        outputTile.setPixels(outPixels, 0, outputSize, 0, 0, outputSize, outputSize);
+
+                        int destX = tx * outputSize;
+                        int destY = ty * outputSize;
+                        for (int py = 0; py < outputSize; py++) {
+                            for (int px = 0; px < outputSize; px++) {
+                                if (destX + px < result.getWidth() && destY + py < result.getHeight()) {
+                                    result.setPixel(destX + px, destY + py, outputTile.getPixel(px, py));
+                                }
+                            }
+                        }
+
+                        inputTile.recycle();
+                        outputTile.recycle();
+                        tile.recycle();
+                    }
+                }
+
+                String enhancedName = "enhanced_" + sourceFile.getName();
+                File enhancedFile = new File(getExternalFilesDir(null), enhancedName);
+                try (FileOutputStream fos = new FileOutputStream(enhancedFile)) {
+                    result.compress(Bitmap.CompressFormat.JPEG, 95, fos);
+                }
+
+                saveToPublicGallery(enhancedFile, enhancedName);
+
+                Bitmap finalResult = result;
+                runOnUiThread(() -> {
+                    ivResult.setImageBitmap(finalResult);
+                    ivResult.setVisibility(View.VISIBLE);
+                    Toast.makeText(this, "Enhanced successfully", Toast.LENGTH_LONG).show();
+                });
+
+                source.recycle();
+
+            } catch (Exception e) {
+                Log.e(TAG, "Enhance failed", e);
+                runOnUiThread(() -> Toast.makeText(this, "Enhance failed: " + e.getMessage(),
+                        Toast.LENGTH_LONG).show());
+            }
+        }).start();
+    }
+
     private Uri saveToPublicGallery(File sourceFile, String fileName) {
-        OutputStream outputStream = null;
-        FileInputStream inputStream = null;
+        java.io.OutputStream outputStream = null;
+        java.io.FileInputStream inputStream = null;
         try {
             ContentValues values = new ContentValues();
             values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
             values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // أندرويد 10 وما فوق - استخدام RELATIVE_PATH
                 values.put(MediaStore.Images.Media.RELATIVE_PATH,
                         Environment.DIRECTORY_PICTURES + "/ProCamera100x");
                 values.put(MediaStore.Images.Media.IS_PENDING, 1);
             } else {
-                // أندرويد 9 وما دون - استخدام DATA (المسار المباشر)
                 File picturesDir = new File(
                         Environment.getExternalStoragePublicDirectory(
                                 Environment.DIRECTORY_PICTURES),
                         "ProCamera100x");
-                if (!picturesDir.exists()) {
-                    picturesDir.mkdirs();
-                }
+                if (!picturesDir.exists()) picturesDir.mkdirs();
                 File destFile = new File(picturesDir, fileName);
                 values.put(MediaStore.Images.Media.DATA, destFile.getAbsolutePath());
             }
@@ -215,13 +404,10 @@ public class MainActivity extends AppCompatActivity {
             Uri uri = getContentResolver().insert(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
 
-            if (uri == null) {
-                Log.e(TAG, "insert returned null URI");
-                return null;
-            }
+            if (uri == null) return null;
 
             outputStream = getContentResolver().openOutputStream(uri);
-            inputStream = new FileInputStream(sourceFile);
+            inputStream = new java.io.FileInputStream(sourceFile);
 
             if (outputStream == null) return null;
 
@@ -232,7 +418,6 @@ public class MainActivity extends AppCompatActivity {
             }
             outputStream.flush();
 
-            // إزالة IS_PENDING ليصبح الملف مرئياً
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 values.clear();
                 values.put(MediaStore.Images.Media.IS_PENDING, 0);
@@ -242,7 +427,7 @@ public class MainActivity extends AppCompatActivity {
             return uri;
 
         } catch (IOException e) {
-            Log.e(TAG, "فشل حفظ الصورة", e);
+            Log.e(TAG, "Gallery save failed", e);
             return null;
         } finally {
             try {
@@ -266,8 +451,7 @@ public class MainActivity extends AppCompatActivity {
             if (allPermissionsGranted()) {
                 startCamera();
             } else {
-                Toast.makeText(this, "الصلاحيات مطلوبة",
-                        Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "Permissions required", Toast.LENGTH_SHORT).show();
                 finish();
             }
         }
@@ -277,5 +461,6 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         cameraExecutor.shutdown();
+        if (tflite != null) tflite.close();
     }
 }
