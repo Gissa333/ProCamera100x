@@ -6,7 +6,6 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- حاوية التقريب الرقمي -->
     <com.procamera.x100.ZoomLinearLayout
         android:id="@+id/zoomContainer"
         android:layout_width="match_parent"
@@ -18,7 +17,18 @@
             android:layout_height="match_parent" />
     </com.procamera.x100.ZoomLinearLayout>
 
-    <!-- شريط التحكم -->
+    <ImageView
+        android:id="@+id/ivAiOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:scaleType="fitCenter"
+        android:alpha="0"
+        android:visibility="visible"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -63,14 +73,13 @@
                 android:id="@+id/btnAIEnhance"
                 android:layout_width="wrap_content"
                 android:layout_height="60dp"
-                android:text="تحسين AI"
+                android:text="AI مباشر"
                 android:layout_marginStart="16dp"
                 android:backgroundTint="#4CAF50"
                 android:textColor="#FFFFFF"/>
         </LinearLayout>
     </LinearLayout>
 
-    <!-- صورة النتيجة -->
     <ImageView
         android:id="@+id/ivResult"
         android:layout_width="match_parent"
