@@ -6,6 +6,7 @@ import android.content.pm.PackageManager;
 import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Matrix;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -23,8 +24,10 @@ import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.camera.core.Camera;
 import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageCapture;
 import androidx.camera.core.ImageCaptureException;
+import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
@@ -49,11 +52,15 @@ import java.util.Locale;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MainActivity extends AppCompatActivity {
 
     private static final int REQUEST_CODE_PERMISSIONS = 10;
     private static final String TAG = "ProCamera100x";
+    private static final int MODEL_INPUT_SIZE = 50;
+    private static final int MODEL_OUTPUT_SIZE = 200;
+    private static final long LIVE_FRAME_INTERVAL_MS = 100; // 10 FPS
 
     private PreviewView previewView;
     private ZoomLinearLayout zoomContainer;
@@ -61,15 +68,23 @@ public class MainActivity extends AppCompatActivity {
     private TextView tvZoomLevel;
     private Button btnCapture, btnAIEnhance;
     private ImageView ivResult;
+    private ImageView ivAiOverlay;
 
     private ImageCapture imageCapture;
+    private ImageAnalysis imageAnalysis;
     private Camera camera;
     private ExecutorService cameraExecutor;
+    private ExecutorService analysisExecutor;
+
     private Interpreter tflite;
     private boolean modelLoaded = false;
 
     private float currentZoomLevel = 1.0f;
     private File lastCapturedFile = null;
+
+    private final AtomicBoolean isProcessingFrame = new AtomicBoolean(false);
+    private volatile long lastFrameTime = 0L;
+    private volatile boolean liveAiEnabled = true;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -83,8 +98,10 @@ public class MainActivity extends AppCompatActivity {
         btnCapture = findViewById(R.id.btnCapture);
         btnAIEnhance = findViewById(R.id.btnAIEnhance);
         ivResult = findViewById(R.id.ivResult);
+        ivAiOverlay = findViewById(R.id.ivAiOverlay);
 
         cameraExecutor = Executors.newSingleThreadExecutor();
+        analysisExecutor = Executors.newSingleThreadExecutor();
 
         loadModel();
 
@@ -111,6 +128,7 @@ public class MainActivity extends AppCompatActivity {
                         Log.e(TAG, "Cannot set zoom", e);
                     }
                     tvZoomLevel.setText(progress + "x");
+                    updateOverlayAlpha();
                 }
             }
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
@@ -120,43 +138,59 @@ public class MainActivity extends AppCompatActivity {
         btnCapture.setOnClickListener(v -> takePhoto());
 
         btnAIEnhance.setOnClickListener(v -> {
-            if (!modelLoaded) {
-                Toast.makeText(this, "نموذج AI لم يُحمّل", Toast.LENGTH_SHORT).show();
-                return;
-            }
-            if (lastCapturedFile == null || !lastCapturedFile.exists()) {
-                Toast.makeText(this, "التقط صورة أولاً", Toast.LENGTH_SHORT).show();
-                return;
-            }
-            Toast.makeText(this, "جارٍ التحسين بالذكاء الاصطناعي...", Toast.LENGTH_LONG).show();
-            enhanceWithAI(lastCapturedFile);
+            liveAiEnabled = !liveAiEnabled;
+            updateOverlayAlpha();
+            Toast.makeText(this,
+                    liveAiEnabled ? "AI مباشر: مفعل" : "AI مباشر: معطل",
+                    Toast.LENGTH_SHORT).show();
         });
+
+        updateOverlayAlpha();
+    }
+
+    private void updateOverlayAlpha() {
+        if (ivAiOverlay == null) return;
+        if (!liveAiEnabled || !modelLoaded) {
+            ivAiOverlay.setAlpha(0f);
+            return;
+        }
+        // كل ما زاد التقريب، زادت شفافية طبقة AI
+        float alpha;
+        if (currentZoomLevel < 5f) {
+            alpha = 0f;
+        } else if (currentZoomLevel < 20f) {
+            alpha = 0.4f;
+        } else if (currentZoomLevel < 50f) {
+            alpha = 0.7f;
+        } else {
+            alpha = 1.0f;
+        }
+        ivAiOverlay.setAlpha(alpha);
     }
 
     private void loadModel() {
         try {
-            AssetFileDescriptor fileDescriptor = getAssets().openFd("esrgan.tflite");
-            FileInputStream inputStream = new FileInputStream(fileDescriptor.getFileDescriptor());
-            FileChannel fileChannel = inputStream.getChannel();
-            long startOffset = fileDescriptor.getStartOffset();
-            long declaredLength = fileDescriptor.getDeclaredLength();
+            AssetFileDescriptor fd = getAssets().openFd("esrgan.tflite");
+            FileInputStream is = new FileInputStream(fd.getFileDescriptor());
+            FileChannel fc = is.getChannel();
+            long startOffset = fd.getStartOffset();
+            long declaredLength = fd.getDeclaredLength();
 
             if (declaredLength <= 0) {
                 modelLoaded = false;
-                tflite = null;
                 return;
             }
 
-            MappedByteBuffer modelBuffer = fileChannel.map(
-                    FileChannel.MapMode.READ_ONLY, startOffset, declaredLength);
+            MappedByteBuffer buffer = fc.map(FileChannel.MapMode.READ_ONLY,
+                    startOffset, declaredLength);
 
             Interpreter.Options options = new Interpreter.Options();
             options.setNumThreads(4);
-            tflite = new Interpreter(modelBuffer, options);
+            tflite = new Interpreter(buffer, options);
             modelLoaded = true;
-            Log.i(TAG, "AI model loaded: " + declaredLength + " bytes");
-        } catch (Throwable e) {
-            Log.e(TAG, "AI model not available: " + e.getMessage());
+            Log.i(TAG, "Model loaded: " + declaredLength + " bytes");
+        } catch (Throwable t) {
+            Log.e(TAG, "Model load failed", t);
             modelLoaded = false;
             tflite = null;
         }
@@ -177,18 +211,135 @@ public class MainActivity extends AppCompatActivity {
                         .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
                         .build();
 
+                if (modelLoaded) {
+                    imageAnalysis = new ImageAnalysis.Builder()
+                            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                            .build();
+                    imageAnalysis.setAnalyzer(analysisExecutor, this::analyzeFrame);
+                }
+
                 CameraSelector cameraSelector = new CameraSelector.Builder()
                         .requireLensFacing(CameraSelector.LENS_FACING_BACK)
                         .build();
 
                 cameraProvider.unbindAll();
-                camera = cameraProvider.bindToLifecycle(
-                        this, cameraSelector, preview, imageCapture);
+
+                if (imageAnalysis != null) {
+                    camera = cameraProvider.bindToLifecycle(
+                            this, cameraSelector, preview, imageCapture, imageAnalysis);
+                } else {
+                    camera = cameraProvider.bindToLifecycle(
+                            this, cameraSelector, preview, imageCapture);
+                }
 
             } catch (ExecutionException | InterruptedException e) {
                 Log.e(TAG, "Camera start failed", e);
             }
         }, ContextCompat.getMainExecutor(this));
+    }
+
+    private void analyzeFrame(@NonNull ImageProxy imageProxy) {
+        long now = System.currentTimeMillis();
+        if (now - lastFrameTime < LIVE_FRAME_INTERVAL_MS) {
+            imageProxy.close();
+            return;
+        }
+        lastFrameTime = now;
+
+        if (!modelLoaded || tflite == null || !liveAiEnabled) {
+            imageProxy.close();
+            return;
+        }
+
+        if (!isProcessingFrame.compareAndSet(false, true)) {
+            imageProxy.close();
+            return;
+        }
+
+        Bitmap input = null;
+        Bitmap rotated = null;
+        try {
+            input = imageProxyToBitmap(imageProxy);
+            if (input == null) return;
+
+            // تصغير الإطار ليكون مقاسه مناسباً للنموذج
+            int tileSize = MODEL_INPUT_SIZE;
+            Bitmap tile = Bitmap.createScaledBitmap(input, tileSize, tileSize, true);
+
+            ByteBuffer inputBuffer = ByteBuffer.allocateDirect(
+                    4 * tileSize * tileSize * 3);
+            inputBuffer.order(ByteOrder.nativeOrder());
+
+            int[] pixels = new int[tileSize * tileSize];
+            tile.getPixels(pixels, 0, tileSize, 0, 0, tileSize, tileSize);
+
+            for (int px : pixels) {
+                inputBuffer.putFloat(((px >> 16) & 0xFF) / 255.0f);
+                inputBuffer.putFloat(((px >> 8) & 0xFF) / 255.0f);
+                inputBuffer.putFloat((px & 0xFF) / 255.0f);
+            }
+            inputBuffer.rewind();
+
+            int outSize = MODEL_OUTPUT_SIZE;
+            ByteBuffer outputBuffer = ByteBuffer.allocateDirect(
+                    4 * outSize * outSize * 3);
+            outputBuffer.order(ByteOrder.nativeOrder());
+
+            tflite.run(inputBuffer, outputBuffer);
+
+            outputBuffer.rewind();
+            int[] outPixels = new int[outSize * outSize];
+            for (int i = 0; i < outSize * outSize; i++) {
+                float r = outputBuffer.getFloat();
+                float g = outputBuffer.getFloat();
+                float b = outputBuffer.getFloat();
+                int ri = Math.min(255, Math.max(0, (int) (r * 255)));
+                int gi = Math.min(255, Math.max(0, (int) (g * 255)));
+                int bi = Math.min(255, Math.max(0, (int) (b * 255)));
+                outPixels[i] = 0xFF000000 | (ri << 16) | (gi << 8) | bi;
+            }
+
+            Bitmap outputBitmap = Bitmap.createBitmap(
+                    outSize, outSize, Bitmap.Config.ARGB_8888);
+            outputBitmap.setPixels(outPixels, 0, outSize, 0, 0, outSize, outSize);
+
+            runOnUiThread(() -> {
+                ivAiOverlay.setImageBitmap(outputBitmap);
+                ivAiOverlay.setVisibility(View.VISIBLE);
+            });
+
+            tile.recycle();
+        } catch (Throwable t) {
+            Log.e(TAG, "Frame analysis failed", t);
+        } finally {
+            if (input != null) input.recycle();
+            if (rotated != null) rotated.recycle();
+            isProcessingFrame.set(false);
+            imageProxy.close();
+        }
+    }
+
+    private Bitmap imageProxyToBitmap(ImageProxy image) {
+        try {
+            ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+            byte[] bytes = new byte[buffer.remaining()];
+            buffer.get(bytes);
+            Bitmap bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+
+            if (bitmap != null && image.getImageInfo().getRotationDegrees() != 0) {
+                Matrix matrix = new Matrix();
+                matrix.postRotate(image.getImageInfo().getRotationDegrees());
+                Bitmap rotated = Bitmap.createBitmap(bitmap, 0, 0,
+                        bitmap.getWidth(), bitmap.getHeight(), matrix, true);
+                if (rotated != bitmap) bitmap.recycle();
+                return rotated;
+            }
+            return bitmap;
+        } catch (Throwable t) {
+            Log.e(TAG, "ImageProxy decode failed", t);
+            return null;
+        }
     }
 
     private void takePhoto() {
@@ -294,128 +445,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void enhanceWithAI(File sourceFile) {
-        new Thread(() -> {
-            Bitmap source = null;
-            try {
-                if (tflite == null) {
-                    runOnUiThread(() -> Toast.makeText(this, "AI model not loaded",
-                            Toast.LENGTH_SHORT).show());
-                    return;
-                }
-
-                BitmapFactory.Options opts = new BitmapFactory.Options();
-                opts.inSampleSize = 4;
-                source = BitmapFactory.decodeFile(sourceFile.getAbsolutePath(), opts);
-                if (source == null) {
-                    runOnUiThread(() -> Toast.makeText(this, "Cannot read image",
-                            Toast.LENGTH_SHORT).show());
-                    return;
-                }
-
-                int[] shape = tflite.getInputTensor(0).shape();
-                int inH = shape[1];
-                int inW = shape[2];
-
-                int tilesX = Math.max(1, source.getWidth() / inW);
-                int tilesY = Math.max(1, source.getHeight() / inH);
-                int scale = 4;
-                int outW = inW * scale;
-                int outH = inH * scale;
-
-                Bitmap result = Bitmap.createBitmap(
-                        tilesX * outW, tilesY * outH, Bitmap.Config.ARGB_8888);
-
-                for (int ty = 0; ty < tilesY; ty++) {
-                    for (int tx = 0; tx < tilesX; tx++) {
-                        int x = tx * inW;
-                        int y = ty * inH;
-                        int w = Math.min(inW, source.getWidth() - x);
-                        int h = Math.min(inH, source.getHeight() - y);
-                        if (w <= 0 || h <= 0) continue;
-
-                        Bitmap tile = Bitmap.createBitmap(source, x, y, w, h);
-                        Bitmap inputTile = Bitmap.createScaledBitmap(tile, inW, inH, true);
-
-                        ByteBuffer inputBuffer = ByteBuffer.allocateDirect(
-                                4 * inW * inH * 3);
-                        inputBuffer.order(ByteOrder.nativeOrder());
-
-                        int[] pixels = new int[inW * inH];
-                        inputTile.getPixels(pixels, 0, inW, 0, 0, inW, inH);
-
-                        for (int px : pixels) {
-                            float r = ((px >> 16) & 0xFF) / 255.0f;
-                            float g = ((px >> 8) & 0xFF) / 255.0f;
-                            float b = (px & 0xFF) / 255.0f;
-                            inputBuffer.putFloat(r);
-                            inputBuffer.putFloat(g);
-                            inputBuffer.putFloat(b);
-                        }
-                        inputBuffer.rewind();
-
-                        ByteBuffer outputBuffer = ByteBuffer.allocateDirect(
-                                4 * outW * outH * 3);
-                        outputBuffer.order(ByteOrder.nativeOrder());
-
-                        tflite.run(inputBuffer, outputBuffer);
-
-                        outputBuffer.rewind();
-                        int[] outPixels = new int[outW * outH];
-                        for (int i = 0; i < outW * outH; i++) {
-                            float r = outputBuffer.getFloat();
-                            float g = outputBuffer.getFloat();
-                            float b = outputBuffer.getFloat();
-                            int ri = Math.min(255, Math.max(0, (int) (r * 255)));
-                            int gi = Math.min(255, Math.max(0, (int) (g * 255)));
-                            int bi = Math.min(255, Math.max(0, (int) (b * 255)));
-                            outPixels[i] = 0xFF000000 | (ri << 16) | (gi << 8) | bi;
-                        }
-
-                        Bitmap outputTile = Bitmap.createBitmap(outW, outH, Bitmap.Config.ARGB_8888);
-                        outputTile.setPixels(outPixels, 0, outW, 0, 0, outW, outH);
-
-                        int destX = tx * outW;
-                        int destY = ty * outH;
-                        for (int py = 0; py < outH; py++) {
-                            for (int px = 0; px < outW; px++) {
-                                if (destX + px < result.getWidth() && destY + py < result.getHeight()) {
-                                    result.setPixel(destX + px, destY + py, outputTile.getPixel(px, py));
-                                }
-                            }
-                        }
-
-                        inputTile.recycle();
-                        outputTile.recycle();
-                        tile.recycle();
-                    }
-                }
-
-                String enhancedName = "enhanced_" + sourceFile.getName();
-                File enhancedFile = new File(getExternalFilesDir(null), enhancedName);
-                try (FileOutputStream fos = new FileOutputStream(enhancedFile)) {
-                    result.compress(Bitmap.CompressFormat.JPEG, 95, fos);
-                }
-
-                saveToPublicGallery(enhancedFile, enhancedName);
-
-                Bitmap finalResult = result;
-                runOnUiThread(() -> {
-                    ivResult.setImageBitmap(finalResult);
-                    ivResult.setVisibility(View.VISIBLE);
-                    Toast.makeText(this, "تم تحسين الصورة بالذكاء الاصطناعي", Toast.LENGTH_LONG).show();
-                });
-
-            } catch (Throwable e) {
-                Log.e(TAG, "Enhance failed", e);
-                runOnUiThread(() -> Toast.makeText(this,
-                        "فشل التحسين: " + e.getMessage(), Toast.LENGTH_LONG).show());
-            } finally {
-                if (source != null) source.recycle();
-            }
-        }).start();
-    }
-
     private Uri saveToPublicGallery(File sourceFile, String fileName) {
         java.io.OutputStream outputStream = null;
         FileInputStream inputStream = null;
@@ -499,6 +528,7 @@ public class MainActivity extends AppCompatActivity {
         super.onDestroy();
         try {
             cameraExecutor.shutdown();
+            analysisExecutor.shutdown();
             if (tflite != null) tflite.close();
         } catch (Throwable ignored) {}
     }
